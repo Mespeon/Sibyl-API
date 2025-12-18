@@ -11,12 +11,8 @@ return new class extends Migration
      */
     public function up(): void
     {
-        Schema::create('courses', function (Blueprint $table) {
-            $table->id();
-            $table->string('code', 10)->comment('Short code for this course');
-            $table->string('name', 100)->comment('Full name for this course');
-            $table->timestamps();
-            $table->softDeletes();
+        Schema::table('password_reset_tokens', function (Blueprint $table) {
+            $table->longText('token')->change();
         });
     }
 
@@ -25,6 +21,6 @@ return new class extends Migration
      */
     public function down(): void
     {
-        Schema::dropIfExists('courses');
+        //
     }
 };

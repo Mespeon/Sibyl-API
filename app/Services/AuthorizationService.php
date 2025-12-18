@@ -14,29 +14,27 @@ use Tymon\JWTAuth\Claims\Expiration;
 
 use App\Models\User;
 use App\Models\UserProfiles;
-use App\Models\UserStudentProfiles;
 use App\Models\UserRoles;
-use App\Models\UserDepartments;
+use App\Models\PasswordResetTokens;
 
 use App\Exceptions\UnprocessableEntityException;
 use App\Exceptions\ServerErrorException;
 
 class AuthorizationService {
-    protected $users, $userProfiles, $userStudentProfiles, $userRoles, $userDepartments;
+    protected $users, $userProfiles, $userRoles, $passwordResetTokens;
 
     public function __construct(
         User $users,
         UserProfiles $userProfiles,
-        UserStudentProfiles $userStudentProfiles,
         UserRoles $userRoles,
-        UserDepartments $userDepartments
+        PasswordResetTokens $passwordResetTokens
     ) {
         $this->users = $users;
         $this->userProfiles = $userProfiles;
-        $this->userStudentProfiles = $userStudentProfiles;
         $this->userRoles = $userRoles;
-        $this->userDepartments = $userDepartments;
+        $this->passwordResetTokens = $passwordResetTokens;
     }
+
     /**
      * Generate Guest Access Token Claims
      * 
@@ -61,6 +59,24 @@ class AuthorizationService {
         return $guestAccessClaims;
     }
 
+    public function generatePasswordResetAccessToken($data) {
+        $iss = new Issuer('Sibyl-System');
+        $sub = $data['subject'];
+        $aud = 'user';
+        $iat = new IssuedAt(Date::now());
+        $exp = new Expiration(Date::now()->addMinutes($data['validity']));
+
+        $passwordResetAccessClaims = [
+            'iad' => $iat,
+            'exp' => $exp,
+            'aud' => $aud,
+            'iss' => $iss,
+            'sub' => $sub
+        ];
+
+        return $passwordResetAccessClaims;
+    }
+
     /**
      * Construct Access Token
      * 
@@ -71,7 +87,7 @@ class AuthorizationService {
         $payload = JWTFactory::make($makeClaim);
         $token = JWTAuth::encode($payload);
         $tokenResponse = $this->respondWithToken($token->get());
-        return ['payload' => $payload, 'token' => $tokenResponse->original['token']];
+        return ['payload' => $payload, 'token' => $tokenResponse->original['access_token']];
     }
 
     /**
@@ -93,14 +109,10 @@ class AuthorizationService {
         $account = $data->only(['username', 'password']);
         $profile = $data->only(['first_name', 'middle_name', 'last_name', 'email_address', 'contact_number']);
         $role = $data->only(['role']);
-        $department = $data->only(['department']);
-
-        // If the registering user uses a Student role, then create params for student profile.
-        $studentProfile = ($data->role == 3) ? $data->only(['course', 'year', 'section']) : null;
 
         try {
             // Create user account.
-            $createUserAccountTransaction = DB::transaction(function () use ($account, $profile, $role, $department, $studentProfile) {
+            $createUserAccountTransaction = DB::transaction(function () use ($account, $profile, $role) {
                 $user = $this->users->setNewUser($account);
 
                 // Assign a user ID to profile, role, and department.
@@ -110,22 +122,8 @@ class AuthorizationService {
                 $role['role_id'] = (int) $role['role'];
                 unset($role['role']);
 
-                $department['department_id'] = (int) $department['department'];
-                unset($department['department']);
-
                 $this->userProfiles->setNewUserProfile($profile);
                 $this->userRoles->setNewUserRole($role);
-                $this->userDepartments->setNewUserDepartment($department);
-
-                // If a student profile was set, attempt to create it as well.
-                if ($studentProfile) {
-                    $studentProfile['user_id'] = $user->id;
-                    $studentProfile['course_id'] = $studentProfile['course'];
-                    $studentProfile['year_level'] = $studentProfile['year'];
-                    unset($studentProfile['course'], $studentProfile['year']);
-
-                    $this->userStudentProfiles->setNewUserStudentProfile($studentProfile);
-                }
 
                 return ['account' => $user];
             }, 1);
@@ -135,5 +133,89 @@ class AuthorizationService {
         catch (\Exception $e) {
             throw new ServerErrorException("An error has occurred while attempting to create account: {$e->getMessage()}", '', '');
         }
+    }
+
+    /**
+     * Finds a user by username to determine existence.
+     */
+    public function findUser($username) {
+        return $this->users->where('username', $username)->exists();
+    }
+
+    /**
+     * Finds a user by email address to determine existence.
+     */
+    public function findUserByEmail($email) {
+        return $this->userProfiles->where('email_address', $email)->exists();
+    }
+
+    /**
+     * Retrieves a user password hash by user ID.
+     */
+    public function retrieveUserPassword(int $userId) {
+        return $this->users->find($userId)->makeVisible('password');
+    }
+
+    /**
+     * Retrieve user data by email.
+     */
+    public function retrieveUserByEmail($email) {
+        return $this->userProfiles->where('email_address', $email)->get();
+    }
+
+    /**
+     * Retrieves all user's roles.
+     */
+    public function retrieveUserRoles($data) {
+        return $this->userRoles
+        ->where('user_id', $data['user_id'])
+        ->with('role')
+        ->get();
+    }
+
+    /**
+     * Finds a user role by role ID to determine existence.
+     */
+    public function findUserRole($data) {
+        $where = [
+            ['user_id', '=', $data['user_id']],
+            ['role_id', '=', $data['role_id']]
+        ];
+        return $this->userRoles->where($where)->exists();
+    }
+
+    /**
+     * Records the token issued when resetting passwords.
+     */
+    public function setNewPasswordResetToken($data) {
+        foreach ($data as $key => $value) {
+            $this->passwordResetTokens->$key = $value;
+        }
+        $this->passwordResetTokens->save();
+        return $this->passwordResetTokens;
+    }
+
+    /**
+     * Updates a user's password.
+     * 
+     * @param int data.user_id
+     * @param string data.password
+     */
+    public function updateUserPassword(array $data) {
+        $data['password'] = Hash::make($data['password']);
+        return tap($this->users->where('id', $data['user_id'])->update([
+            'password' => $data['password']
+        ]));
+    }
+
+    /**
+     * Verifies if the provided password matches with the old one.
+     * 
+     * @param int $data.user_id - ID of user changing their passwords.
+     * @param string $data.current_password - Current password as sent from user input.
+     */
+    public function verifyPassword(array $data) {
+        $userPassword = $this->retrieveUserPassword($data['user_id']);
+        return password_verify($data['current_password'], $userPassword->password);
     }
 }

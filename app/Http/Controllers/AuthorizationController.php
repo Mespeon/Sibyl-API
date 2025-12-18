@@ -9,13 +9,11 @@ use Illuminate\Support\Facades\Crypt;
 use Illuminate\Validation\ValidationException;
 
 use App\Services\AuthorizationService;
-
 use App\Models\User;
-
 use App\Exceptions\UnprocessableEntityException;
 use App\Exceptions\ServerErrorException;
-use Illuminate\Validation\UnauthorizedException;
-
+use App\Exceptions\NotFoundException;
+use App\Jobs\DispatchForgotPasswordEmail;
 class AuthorizationController extends Controller {
     protected $users, $authorizationService;
 
@@ -30,7 +28,9 @@ class AuthorizationController extends Controller {
             'except' => [
                 'generateGuestAccessToken',
                 'register',
-                'login'
+                'login',
+                'forgotPassword',
+                'testRecordAttendance'
             ]
         ]);
     }
@@ -110,27 +110,19 @@ class AuthorizationController extends Controller {
                 // Password confirmation - should match with password.
                 'password_confirmation' => 'required_if:is_third_party_login,0|string|same:password',
                 // First name of user
-                'first_name' => 'required|string|max:100',
+                'first_name' => 'required|string|max:50',
                 // Optional - middle name of user
-                'middle_name' => 'nullable|string|max:100',
+                'middle_name' => 'nullable|string|max:50',
                 // Last name of user
-                'last_name' => 'required|string|max:100',
+                'last_name' => 'required|string|max:50',
                 // Email address of user
-                'email_address' => 'required|email',
+                'email_address' => 'required|email|unique:user_profiles',
                 // Contact number of user
                 'contact_number' => 'required|string',
-                // Parent department of user
-                'department' => 'required|numeric',
                 // Role of registering user
                 'role' => 'required|numeric',
                 // Flag whether this registration is from a third-party login.
-                'is_third_party_login' => 'required|boolean',
-                // Course taken by the user. Required if role is Student.
-                'course' => 'required_if:role,3|numeric',
-                // Current year of the user. Required if role is Student.
-                'year' => 'required_if:role,3|numeric',
-                // Section of the user. Required if role is Student.
-                'section' => 'required_if:role,3|string'
+                'is_third_party_login' => 'required|boolean'
             ]);
         }
         catch (ValidationException $e) {
@@ -138,8 +130,7 @@ class AuthorizationController extends Controller {
         }
 
         try {
-            // Attempt to create the account, profile, role, and department rows for this user.
-            // If user is registering as a student, create a student profile for them as well.
+            // Attempt to create the account, profile, and role rows for this user.
             $createFullAccount = $this->authorizationService->createUserAccount($request);
             $response = [
                 'message' => 'Account registered.',
@@ -180,6 +171,10 @@ class AuthorizationController extends Controller {
 
         try {
             // Attempt to login the user.
+            if (!$this->authorizationService->findUser($request->username)) {
+                throw new NotFoundException('Account is not registered.');
+            }
+
             $credentials = $request->only(['username', 'password']);
             if (!$token = auth()->attempt($credentials)) {
                 $response['message'] = 'Incorrect username or password.';
@@ -192,6 +187,9 @@ class AuthorizationController extends Controller {
                 'message' => 'Successfully logged in.',
                 'data' => $accessToken->original
             ];
+        }
+        catch (NotFoundException $notFound) {
+            throw new NotFoundException($notFound->getMessage());
         }
         catch (\Exception $e) {
             throw new ServerErrorException('A server error has occurred while handling this request.', $request->path(), $e->getMessage());
@@ -217,6 +215,126 @@ class AuthorizationController extends Controller {
             // Logout user then invalidate/blacklist the token.
             Auth::logout(true);
             $response['message'] = 'Logged out.';
+        }
+        catch (\Exception $e) {
+            throw new ServerErrorException('A server error has occurred while handling this request.', $request->path(), $e->getMessage());
+        }
+
+        return response()->json($response, $status);
+    }
+
+    /**
+     * Forgot Password
+     * 
+     * Begins a forgot password process flow for the user.
+     * 
+     * @unauthenticated
+     * @verb POST
+     * @path api/v1/auth/forgot-password
+     * @param Request
+     * @return Response
+     */
+    public function forgotPassword(Request $request) {
+        $response = $this->getBlankResponse();
+        $status = 200;
+
+        try {
+            // Validate request.
+            $this->validate($request, [
+                'email_address' => 'required|email'
+            ]);
+
+            // Check if email address exists.
+            if (!$this->authorizationService->findUserByEmail($request->email_address)) {
+                throw new NotFoundException('Email address is not registered, or may be incorrect.');
+            }
+
+            // Retrieve user data.
+            $userProfile = $this->authorizationService->retrieveUserByEmail($request->email_address);
+
+            // Generate a password reset token for this user.
+            $passwordResetClaims = $this->authorizationService->generatePasswordResetAccessToken([
+                'subject' => $userProfile->first()['user_id'],
+                'validity' => 15
+            ]);
+
+            $passwordResetToken = $this->authorizationService->constructAccessToken($passwordResetClaims);
+            $rehashedToken = md5($passwordResetToken['token']);
+
+            // Record password reset token.
+            $recordPasswordResetParams = [
+                'user_id' => $userProfile->first()['user_id'],
+                'email_address' => $request->email_address,
+                'token' => $passwordResetToken['token']
+            ];
+            $this->authorizationService->setNewPasswordResetToken($recordPasswordResetParams);
+
+            $response['message'] = 'An email containing a password reset link is sent to the address provided.';
+
+            // Queue the email using jobs for asynchronous processing.
+            DispatchForgotPasswordEmail::dispatch($request->email_address, $rehashedToken)->delay(Date::now()->addSeconds(5));
+        }
+        catch (ValidationException $ve) {
+            throw new UnprocessableEntityException('Unable to process request due to incorrect input.', $ve->errors());
+        }
+        catch (NotFoundException $nfe) {
+            throw new NotFoundException($nfe->getMessage());
+        }
+        catch (\Exception $e) {
+            throw new ServerErrorException('A server error has occurred while handling this request.', $request->path(), $e->getMessage());
+        }
+
+        return response()->json($response, $status);
+    }
+
+    /**
+     * Reset Password
+     * 
+     * Resets password from a forgot password process flow.
+     * 
+     * @authenticated
+     * @verb POST
+     * @path api/v1/reset-password
+     * @param Request
+     * @param Response
+     */
+    public function resetPassword(Request $request) {
+        $response = $this->getBlankResponse();
+        $status = 200;
+
+        try {
+            // Validate request.
+            $this->validate($request, [
+                // Desired password
+                'password' => [
+                    'required',
+                    'string',
+                    'min:8',
+                    'max:32',
+                    'regex:/[a-z]/',
+                    'regex:/[A-Z]/',
+                    'regex:/[0-9]/',
+                    'regex:/[@$!%*#?&]/',
+                    'confirmed'
+                ],
+                // Password confirmation - should match with password.
+                'password_confirmation' => 'required|string|same:password',
+            ]);
+
+            // If it passes validation, take the user ID from the token then update the user's password.
+            $userToken = Auth::payload()->get('sub');
+            $updateUserPassword = $this->authorizationService->updateUserPassword([
+                'user_id' => $userToken,
+                'password' => $request->password
+            ]);
+
+            $response['message'] = 'Password has been reset. You may now login using your new password.';
+
+            // Invalidate the sent token.
+            Auth::invalidate(true);
+        }
+        catch (ValidationException $ve) {
+            throw new UnprocessableEntityException('Unable to process request due to incorrect input.', $ve->errors());
         }
         catch (\Exception $e) {
             throw new ServerErrorException('A server error has occurred while handling this request.', $request->path(), $e->getMessage());

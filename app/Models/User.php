@@ -47,16 +47,53 @@ class User extends Authenticatable implements JWTSubject {
         'password' => 'hashed',
     ];
 
+    // Serializes and returns timestamps as is.
+    protected function serializeDate($date) {
+        return $date->format('Y-m-d H:i:s');
+    }
+
     public function getJWTIdentifier() {
         return $this->getKey();
     }
 
     public function getJWTCustomClaims() {
-        return [];
+        // Encode user roles into token.
+        $role = $this->load('role:user_id,role_id');
+        $roleRemapped = array_map(function ($item) {
+            return $item['role_id'];
+        }, $role['role']->toArray());
+
+        return [
+            'roles' => $roleRemapped
+        ];
     }
 
     public function account_status() {
-        return $this->hasOne(Statuses::class, 'id', 'status_id');
+        return $this->hasOne(AccountStatuses::class, 'id', 'status_id')->select([
+            'id',
+            'key',
+            'name'
+        ]);
+    }
+
+    public function role() {
+        return $this->hasMany(UserRoles::class, 'user_id', 'id')->select([
+            'user_roles.id',
+            'user_id',
+            'role_id'
+        ]);
+    }
+
+    public function profile() {
+        return $this->hasOne(UserProfiles::class, 'user_id', 'id')->select([
+            'id',
+            'user_id',
+            'first_name',
+            'middle_name',
+            'last_name',
+            'email_address',
+            'contact_number'
+        ]);
     }
 
     public function student_profile() {
